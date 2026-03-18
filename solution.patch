@@ -1,0 +1,756 @@
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/arch/x86/entry/syscalls/syscall_32.tbl kernel/arch/x86/entry/syscalls/syscall_32.tbl
+--- original-kernel/arch/x86/entry/syscalls/syscall_32.tbl	2024-02-23 09:51:59.000000000 +0100
++++ kernel/arch/x86/entry/syscalls/syscall_32.tbl	2024-05-05 15:05:24.653956400 +0200
+@@ -461,3 +461,6 @@
+ 454	i386	futex_wake		sys_futex_wake
+ 455	i386	futex_wait		sys_futex_wait
+ 456	i386	futex_requeue		sys_futex_requeue
++# CHANGED - ZSO 2024
++457 i386    count_redactions    sys_count_redactions
++458 i386    reset_redactions    sys_reset_redactions
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/arch/x86/entry/syscalls/syscall_64.tbl kernel/arch/x86/entry/syscalls/syscall_64.tbl
+--- original-kernel/arch/x86/entry/syscalls/syscall_64.tbl	2024-02-23 09:51:59.000000000 +0100
++++ kernel/arch/x86/entry/syscalls/syscall_64.tbl	2024-05-05 15:05:35.300092500 +0200
+@@ -378,6 +378,10 @@
+ 454	common	futex_wake		sys_futex_wake
+ 455	common	futex_wait		sys_futex_wait
+ 456	common	futex_requeue		sys_futex_requeue
++# CHANGED - ZSO 2024
++457 common  count_redactions    sys_count_redactions
++458 common  reset_redactions    sys_reset_redactions
++
+ 
+ #
+ # Due to a historical design error, certain syscalls are numbered differently
+Tylko w original-kernel: .clang-format
+Tylko w original-kernel: .cocciconfig
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/fs/file.c kernel/fs/file.c
+--- original-kernel/fs/file.c	2024-02-23 09:51:59.000000000 +0100
++++ kernel/fs/file.c	2024-05-05 23:04:25.421981600 +0200
+@@ -1451,3 +1451,30 @@ int iterate_fd(struct files_struct *file
+ 	return res;
+ }
+ EXPORT_SYMBOL(iterate_fd);
++
++// CHANGED - ZSO 2024
++SYSCALL_DEFINE1(count_redactions, int, fd)
++{
++    struct file *file = fget_raw(fd);
++    int ret = -EBADF;
++
++    if (file) {
++        ret = atomic_long_read_acquire(&file->f_redacted_count);
++    }
++
++    return ret;
++}
++
++SYSCALL_DEFINE1(reset_redactions, int, fd)
++{
++    struct file *file = fget_raw(fd);
++    int ret = -EBADF;
++
++    if (file){
++        atomic_long_set_release(&file->f_redacted_count, 0);
++        ret = 0;
++    }
++
++    return ret;
++}
++
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/fs/file_table.c kernel/fs/file_table.c
+--- original-kernel/fs/file_table.c	2024-02-23 09:51:59.000000000 +0100
++++ kernel/fs/file_table.c	2024-05-05 21:16:16.557194700 +0200
+@@ -171,6 +171,11 @@ static int init_file(struct file *f, int
+ 
+ 	rwlock_init(&f->f_owner.lock);
+ 	spin_lock_init(&f->f_lock);
++    
++    // CHANGED - ZSO 2024
++    f->f_is_redacted = false;
++    atomic_long_set(&f->f_redacted_count, 0);
++
+ 	mutex_init(&f->f_pos_lock);
+ 	f->f_flags = flags;
+ 	f->f_mode = OPEN_FMODE(flags);
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/fs/open.c kernel/fs/open.c
+--- original-kernel/fs/open.c	2024-02-23 09:51:59.000000000 +0100
++++ kernel/fs/open.c	2024-05-05 23:04:25.422193700 +0200
+@@ -37,6 +37,9 @@
+ 
+ #include "internal.h"
+ 
++// CHANGED - ZSO 2024
++#include <linux/redactor.h>
++
+ int do_truncate(struct mnt_idmap *idmap, struct dentry *dentry,
+ 		loff_t length, unsigned int time_attrs, struct file *filp)
+ {
+@@ -1071,6 +1074,38 @@ char *file_path(struct file *filp, char
+ }
+ EXPORT_SYMBOL(file_path);
+ 
++
++// CHANGED - ZSO 2024
++/**
++ * check_redaction - check if just opened file is to be redacted
++ * 
++ * A file can be redacte by only one program at a time.
++ * 
++ * @file: newly opened file
++ */
++void check_redaction(struct file *file, umode_t umode, __u64 flags){
++
++    // Bezpieczne dla wielowątkowego wywołania, gdyż wątki mogą tylko
++    // ustawić plik w tryb 'bycia redagowanym'. To ile z nich to zrobi to już
++    // żadna różnica.
++    if (likely(!file->f_is_redacted)){
++        struct redactor_ctx rctx;
++        const struct cred *cred = current_cred();
++
++        rctx.flags = flags;
++        rctx.mode  = umode;
++        rctx.uid = cred->uid;
++        rctx.gid = cred->gid;
++
++        int redact = bpf_redactor_decide(&rctx);
++
++        if (redact != NO_REDACT){
++            pr_info("bpf_redact_decide() returned %d", redact);
++            file->f_is_redacted = (redact > 0);
++        }
++    }
++}
++
+ /**
+  * vfs_open - open the file at the given path
+  * @path: path to open
+@@ -1440,6 +1475,8 @@ static long do_sys_openat2(int dfd, cons
+ 			fd = PTR_ERR(f);
+ 		} else {
+ 			fd_install(fd, f);
++            // CHANGED - ZSO 2024
++            check_redaction(f, how->mode, how->flags);
+ 		}
+ 	}
+ 	putname(tmp);
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/fs/read_write.c kernel/fs/read_write.c
+--- original-kernel/fs/read_write.c	2024-02-23 09:51:59.000000000 +0100
++++ kernel/fs/read_write.c	2024-05-05 21:25:23.347064000 +0200
+@@ -22,6 +22,8 @@
+ #include <linux/fs.h>
+ #include "internal.h"
+ 
++#include <linux/redactor.h>
++
+ #include <linux/uaccess.h>
+ #include <asm/unistd.h>
+ 
+@@ -447,9 +449,51 @@ ssize_t kernel_read(struct file *file, v
+ }
+ EXPORT_SYMBOL(kernel_read);
+ 
++// CHANGED - ZSO 2024
++/**
++ * do_redaction - if selected file is under redaction perform the redaction on
++ *                buffer 'buf' of size 'buf_sz' which is at offset 'off' in
++ *                the whole file.
++ * 
++ * If an error occured druing redaction an -EINVAL error is returned.
++ */
++int do_redaction(struct file *file, char __user *buf, size_t buf_sz, loff_t off)
++{
++    if (unlikely(file->f_is_redacted)) {
++        // Pack the buffer and ctx so we can access the buffer via container_of
++        struct packed_redactor_ctx pctx;
++        pctx.rctx.offset = off;
++        pctx.rctx.size   = buf_sz;
++        pctx.user_buf    = buf;
++
++        // pr_info("redactor_ctx {offset = %lld, size = %lu}", off, buf_sz);
++
++        // The redaction is performed only on *local* buffer, thus there
++        // is no need for synchronization. Furthermore there can be only 
++        // one BPF program attached here.
++        int redacted = bpf_redactor_redact(&pctx.rctx);
++        
++        pr_info("bpf_redactor_redact() returned %d", redacted);
++        if (redacted < 0)
++            return -EINVAL;
++
++        // We want to keep global summarized count of redacted lines here (?)
++        // so atomic_long_t is enough.
++        atomic_long_add(redacted, &file->f_redacted_count);
++    }
++
++    return 0;
++}
++
++
+ ssize_t vfs_read(struct file *file, char __user *buf, size_t count, loff_t *pos)
+ {
+ 	ssize_t ret;
++    int redact;
++    // CHANGED - ZSO 2024
++    // The 'pos' pointer can be NULL in some circumstances.
++    // For redaction purpose we can assume this is an offset of 0.
++    loff_t redact_pos = (pos ? *pos : 0);
+ 
+ 	if (!(file->f_mode & FMODE_READ))
+ 		return -EBADF;
+@@ -475,6 +519,13 @@ ssize_t vfs_read(struct file *file, char
+ 		add_rchar(current, ret);
+ 	}
+ 	inc_syscr(current);
++
++    // CHANGED - ZSO 2024
++    redact = do_redaction(file, buf, ret, redact_pos);
++    if (redact < 0) {
++        return redact;
++    }
++
+ 	return ret;
+ }
+ 
+@@ -722,6 +773,13 @@ static ssize_t do_iter_readv_writev(stru
+ {
+ 	struct kiocb kiocb;
+ 	ssize_t ret;
++    // CHANGED - ZSO 2024
++    loff_t redact_pos = (ppos ? *ppos : 0);
++    
++    // Save iterator so we can use is again for possible redaction.
++    struct iov_iter_state istate;
++    iov_iter_save_state(iter, &istate);
++    
+ 
+ 	init_sync_kiocb(&kiocb, filp);
+ 	ret = kiocb_set_rw_flags(&kiocb, flags);
+@@ -736,6 +794,36 @@ static ssize_t do_iter_readv_writev(stru
+ 	BUG_ON(ret == -EIOCBQUEUED);
+ 	if (ppos)
+ 		*ppos = kiocb.ki_pos;
++
++    // CHANGED - ZSO 2024
++    if (unlikely(filp->f_is_redacted) && ret > 0) {
++        iov_iter_restore(iter, &istate);
++        
++        // We cannot iterate over whole iterator since we could have read less
++        size_t bytes_left = (size_t)ret;
++        while (bytes_left > 0){
++            void __user *buf = iter_iov_addr(iter);
++            size_t size = min(iter_iov_len(iter), bytes_left);
++
++            int redact = do_redaction(filp, buf, size, redact_pos);
++            if (redact < 0) {
++                // Problem requirements demand we return EINVAL here
++                // otherwise we could do:
++                /*
++                if (!ret)
++                    ret = redact;
++                */
++                ret = -EINVAL;
++                break;
++            }
++
++            iov_iter_advance(iter, size);
++            redact_pos += size;
++            bytes_left = (bytes_left < size) ? 0 : (bytes_left - size);
++        }
++    }
++    
++
+ 	return ret;
+ }
+ 
+@@ -750,6 +838,11 @@ static ssize_t do_loop_readv_writev(stru
+ 
+ 	while (iov_iter_count(iter)) {
+ 		ssize_t nr;
++        int redact;
++        // CHANGED - ZSO 2024
++        // The 'pos' pointer can be NULL in some circumstances.
++        // For redaction purpose we can assume this is an offset of 0.
++        loff_t redact_pos = (ppos ? *ppos : 0);
+ 
+ 		if (type == READ) {
+ 			nr = filp->f_op->read(filp, iter_iov_addr(iter),
+@@ -767,6 +860,24 @@ static ssize_t do_loop_readv_writev(stru
+ 		ret += nr;
+ 		if (nr != iter_iov_len(iter))
+ 			break;
++		
++
++        // CHANGED - ZSO 2024
++        if (unlikely(filp->f_is_redacted)) {
++            redact = do_redaction(filp, iter_iov_addr(iter), nr, redact_pos);
++            if (redact < 0) {
++                // Problem requirements demand we return EINVAL here
++                // otherwise we could do:
++                /*
++                if (!ret)
++                    ret = redact;
++                */
++                ret = -EINVAL;
++                break;
++            }
++            redact_pos += nr;
++        }
++
+ 		iov_iter_advance(iter, nr);
+ 	}
+ 
+Tylko w original-kernel: .get_maintainer.ignore
+Tylko w original-kernel: .gitattributes
+Tylko w original-kernel: .gitignore
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/include/linux/bpf.h kernel/include/linux/bpf.h
+--- original-kernel/include/linux/bpf.h	2024-02-23 09:51:59.000000000 +0100
++++ kernel/include/linux/bpf.h	2024-05-05 23:04:25.423296700 +0200
+@@ -3066,6 +3066,25 @@ extern const struct bpf_func_proto bpf_u
+ extern const struct bpf_func_proto bpf_cgrp_storage_get_proto;
+ extern const struct bpf_func_proto bpf_cgrp_storage_delete_proto;
+ 
++// CHANGED - ZSO 2024
++extern const struct bpf_func_proto bpf_copy_from_buffer_proto;
++extern const struct bpf_func_proto bpf_copy_to_buffer_proto;
++
++struct redactor_ctx {
++union {
++        struct {
++                loff_t offset;
++                size_t size;
++        };
++        struct {
++                u64 flags;
++                umode_t mode;
++                kuid_t uid;
++                kgid_t gid;
++        };
++};
++};
++
+ const struct bpf_func_proto *tracing_prog_func_proto(
+   enum bpf_func_id func_id, const struct bpf_prog *prog);
+ 
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/include/linux/bpf_types.h kernel/include/linux/bpf_types.h
+--- original-kernel/include/linux/bpf_types.h	2024-02-23 09:51:59.000000000 +0100
++++ kernel/include/linux/bpf_types.h	2024-05-02 20:05:25.275324200 +0200
+@@ -152,3 +152,8 @@ BPF_LINK_TYPE(BPF_LINK_TYPE_PERF_EVENT,
+ BPF_LINK_TYPE(BPF_LINK_TYPE_KPROBE_MULTI, kprobe_multi)
+ BPF_LINK_TYPE(BPF_LINK_TYPE_STRUCT_OPS, struct_ops)
+ BPF_LINK_TYPE(BPF_LINK_TYPE_UPROBE_MULTI, uprobe_multi)
++
++
++// CHANGED - ZSO 2024
++BPF_PROG_TYPE(BPF_PROG_TYPE_REDACTOR, redactor,
++              struct redactor_ctx, struct redactor_ctx)
+\ Brak znaku nowej linii na końcu pliku
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/include/linux/fs.h kernel/include/linux/fs.h
+--- original-kernel/include/linux/fs.h	2024-02-23 09:51:59.000000000 +0100
++++ kernel/include/linux/fs.h	2024-05-05 23:04:25.427397100 +0200
+@@ -1027,6 +1027,11 @@ struct file {
+ 	struct address_space	*f_mapping;
+ 	errseq_t		f_wb_err;
+ 	errseq_t		f_sb_err; /* for syncfs */
++
++    // CHANGED - ZSO 2024
++    bool            f_is_redacted;      /* is file under redaction */
++    atomic_long_t   f_redacted_count;   /* count of symbols redacted overall */
++
+ } __randomize_layout
+   __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
+ 
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/include/linux/redactor.h kernel/include/linux/redactor.h
+--- original-kernel/include/linux/redactor.h	1970-01-01 01:00:00.000000000 +0100
++++ kernel/include/linux/redactor.h	2024-05-05 09:59:13.436685200 +0200
+@@ -0,0 +1,22 @@
++#ifndef _ZSO_REDACTOR_H
++#define _ZSO_REDACTOR_H
++
++#include <linux/bpf.h>
++#include <linux/compiler_attributes.h>
++
++#define NO_REDACT 0
++
++struct packed_redactor_ctx {
++    struct redactor_ctx rctx;
++    // A pointer to just read data
++    char __user *user_buf;
++};
++
++
++noinline int bpf_redactor_decide(struct redactor_ctx *ctx);
++
++noinline int bpf_redactor_redact(struct redactor_ctx *ctx);
++
++
++
++#endif /* _ZSO_REDACTOR_H */
+\ Brak znaku nowej linii na końcu pliku
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/include/linux/syscalls.h kernel/include/linux/syscalls.h
+--- original-kernel/include/linux/syscalls.h	2024-02-23 09:51:59.000000000 +0100
++++ kernel/include/linux/syscalls.h	2024-05-05 23:04:25.422989400 +0200
+@@ -418,6 +418,12 @@ asmlinkage long sys_fallocate(int fd, in
+ asmlinkage long sys_faccessat(int dfd, const char __user *filename, int mode);
+ asmlinkage long sys_faccessat2(int dfd, const char __user *filename, int mode,
+ 			       int flags);
++
++// CHANGED - ZSO 2024
++asmlinkage long sys_count_redactions(int fd);
++asmlinkage long sys_reset_redactions(int fd);
++
++
+ asmlinkage long sys_chdir(const char __user *filename);
+ asmlinkage long sys_fchdir(unsigned int fd);
+ asmlinkage long sys_chroot(const char __user *filename);
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/include/uapi/asm-generic/unistd.h kernel/include/uapi/asm-generic/unistd.h
+--- original-kernel/include/uapi/asm-generic/unistd.h	2024-02-23 09:51:59.000000000 +0100
++++ kernel/include/uapi/asm-generic/unistd.h	2024-05-02 12:33:09.919296000 +0200
+@@ -829,8 +829,13 @@ __SYSCALL(__NR_futex_wait, sys_futex_wai
+ #define __NR_futex_requeue 456
+ __SYSCALL(__NR_futex_requeue, sys_futex_requeue)
+ 
++#define __NR_count_redactions 457
++__SYSCALL(__NR_count_redactions, sys_count_redactions)
++#define __NR_reset_redactions 458
++__SYSCALL(__NR_reset_redactions, sys_reset_redactions)
++
+ #undef __NR_syscalls
+-#define __NR_syscalls 457
++#define __NR_syscalls 459
+ 
+ /*
+  * 32 bit systems traditionally used different
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/include/uapi/linux/bpf.h kernel/include/uapi/linux/bpf.h
+--- original-kernel/include/uapi/linux/bpf.h	2024-02-23 09:51:59.000000000 +0100
++++ kernel/include/uapi/linux/bpf.h	2024-05-03 14:24:03.533661000 +0200
+@@ -995,6 +995,8 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_SK_LOOKUP,
+ 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
+ 	BPF_PROG_TYPE_NETFILTER,
++    // CHANGED - ZSO 2024
++    BPF_PROG_TYPE_REDACTOR, // 0x21
+ };
+ 
+ enum bpf_attach_type {
+@@ -1054,6 +1056,8 @@ enum bpf_attach_type {
+ 	BPF_CGROUP_UNIX_GETSOCKNAME,
+ 	BPF_NETKIT_PRIMARY,
+ 	BPF_NETKIT_PEER,
++    // CHANGED - ZSO 2024
++    BPF_REDACTOR,  // 0x38
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+@@ -5888,6 +5892,8 @@ union bpf_attr {
+ 	FN(user_ringbuf_drain, 209, ##ctx)		\
+ 	FN(cgrp_storage_get, 210, ##ctx)		\
+ 	FN(cgrp_storage_delete, 211, ##ctx)		\
++    FN(copy_to_buffer, 212, ##ctx)          \
++    FN(copy_from_buffer, 213, ##ctx)          
+ 	/* */
+ 
+ /* backwards-compatibility macros for users of __BPF_FUNC_MAPPER that don't
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/kernel/bpf/helpers.c kernel/kernel/bpf/helpers.c
+--- original-kernel/kernel/bpf/helpers.c	2024-02-23 09:51:59.000000000 +0100
++++ kernel/kernel/bpf/helpers.c	2024-05-05 23:04:25.429863600 +0200
+@@ -26,6 +26,9 @@
+ 
+ #include "../../lib/kstrtox.h"
+ 
++// CHANGED - ZSO 2024
++#include <linux/redactor.h>
++
+ /* If kernel subsystem is allowing eBPF programs to call this function,
+  * inside its own verifier_ops->get_func_proto() callback it should return
+  * bpf_map_lookup_elem_proto, so that verifier can properly check the arguments
+@@ -1670,6 +1673,101 @@ static const struct bpf_func_proto bpf_d
+ 	.arg3_type	= ARG_CONST_ALLOC_SIZE_OR_ZERO,
+ };
+ 
++
++
++// CHANGED - ZSO 2024
++long check_buffer_operation(void *ctx, unsigned long offset,
++                            void *ptr, unsigned long size)
++{
++    // Wykorzystujemy kontekst, aby zapamiętać maksymalną długość bufora
++    // ctx->size    - wielkość buforu użytkownika
++
++    // pr_info("Buffer access at %lu of %lu bytes.", offset, size);
++
++    if (!ctx || !ptr) {
++        pr_warn("Wrong contex/buffer pointer.");
++        return -EFAULT;
++    }
++
++    struct packed_redactor_ctx *pctx =
++        container_of(ctx, struct packed_redactor_ctx, rctx);
++
++    // pr_info("ctx.size   = %lu", pctx->rctx.size);
++    // pr_info("ctx.offset = %llu", pctx->rctx.offset);
++    
++    if (!pctx->user_buf) {
++        pr_warn("Invalid user buffer pointer.");
++        return -EFAULT;
++    }
++    
++    if (offset >= pctx->rctx.size) {
++        pr_warn("Buffer operation outside user buffer.");
++        return -EACCES;
++    }
++
++    return min(pctx->rctx.size - offset, size);
++}
++
++BPF_CALL_4(bpf_copy_to_buffer, void *, ctx, unsigned long, offset,
++                               void *, ptr, unsigned long, size)
++{
++    long ret_size = check_buffer_operation(ctx, offset, ptr, size);
++
++    if (ret_size < 0)
++        return ret_size;
++
++    struct packed_redactor_ctx *pctx =
++        container_of(ctx, struct packed_redactor_ctx, rctx);
++
++    memmove(pctx->user_buf + offset, ptr, ret_size);
++
++    return 0;
++}
++
++const struct bpf_func_proto bpf_copy_to_buffer_proto = {
++    .func       = bpf_copy_to_buffer,
++    .gpl_only   = false,
++    .ret_type   = RET_INTEGER,
++    .arg1_type  = ARG_PTR_TO_CTX,
++    .arg2_type  = ARG_ANYTHING,
++    .arg3_type  = ARG_PTR_TO_MEM,
++    .arg4_type  = ARG_CONST_SIZE_OR_ZERO,
++};
++
++BPF_CALL_4(bpf_copy_from_buffer, void *, ctx, unsigned long, offset,
++                                 void *, ptr, unsigned long, size)
++{
++    long ret_size = check_buffer_operation(ctx, offset, ptr, size);
++    
++    if (ret_size < 0)
++        return ret_size;
++
++    struct packed_redactor_ctx *pctx =
++        container_of(ctx, struct packed_redactor_ctx, rctx);
++
++    memmove(ptr, pctx->user_buf + offset, ret_size);
++
++    return 0;
++}
++
++const struct bpf_func_proto bpf_copy_from_buffer_proto = {
++    .func       = bpf_copy_from_buffer,
++    .gpl_only   = false,
++    .ret_type   = RET_INTEGER,
++    .arg1_type  = ARG_PTR_TO_CTX,
++    .arg2_type  = ARG_ANYTHING,
++    .arg3_type  = ARG_PTR_TO_MEM,
++    .arg4_type  = ARG_CONST_SIZE_OR_ZERO,
++};
++
++// // CHANGED - ZSO 2024
++// // bpf.h 5907 definiuje BPF_FUNC_ ...
++// case BPF_FUNC_copy_to_buffer:
++//     return &bpf_copy_to_buffer_proto;
++// case BPF_FUNC_copy_from_buffer:
++//     return &bpf_copy_from_buffer_proto;
++
++
+ const struct bpf_func_proto bpf_get_current_task_proto __weak;
+ const struct bpf_func_proto bpf_get_current_task_btf_proto __weak;
+ const struct bpf_func_proto bpf_probe_read_user_proto __weak;
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/kernel/bpf/syscall.c kernel/kernel/bpf/syscall.c
+--- original-kernel/kernel/bpf/syscall.c	2024-02-23 09:51:59.000000000 +0100
++++ kernel/kernel/bpf/syscall.c	2024-05-05 23:04:25.430065900 +0200
+@@ -36,6 +36,9 @@
+ #include <linux/memcontrol.h>
+ #include <linux/trace_events.h>
+ 
++// CHANGED - ZSO 2024
++#include <linux/redactor.h>
++
+ #include <net/netfilter/nf_bpf_link.h>
+ #include <net/netkit.h>
+ #include <net/tcx.h>
+@@ -2447,6 +2450,8 @@ bpf_prog_load_check_attach(enum bpf_prog
+ 		case BPF_PROG_TYPE_LSM:
+ 		case BPF_PROG_TYPE_STRUCT_OPS:
+ 		case BPF_PROG_TYPE_EXT:
++        // CHANGED - ZSO 2024
++        case BPF_PROG_TYPE_REDACTOR:
+ 			break;
+ 		default:
+ 			return -EINVAL;
+@@ -2526,6 +2535,14 @@ bpf_prog_load_check_attach(enum bpf_prog
+ 		if (expected_attach_type == BPF_NETFILTER)
+ 			return 0;
+ 		return -EINVAL;
++
++    // CHANGED - ZSO 2024
++    case BPF_PROG_TYPE_REDACTOR:        
++        if (expected_attach_type == BPF_REDACTOR)
++            return 0;
++        
++        return -EINVAL;
++
+ 	case BPF_PROG_TYPE_SYSCALL:
+ 	case BPF_PROG_TYPE_EXT:
+ 		if (expected_attach_type)
+@@ -3155,6 +3181,13 @@ static int bpf_tracing_prog_attach(struc
+ 			goto out_put_prog;
+ 		}
+ 		break;
++    // CHANGED - ZSO 2024
++    case BPF_PROG_TYPE_REDACTOR:
++        if (prog->expected_attach_type != BPF_REDACTOR){
++            err = -EINVAL;
++            goto out_put_prog;
++        }
++        break;
+ 	default:
+ 		err = -EINVAL;
+ 		goto out_put_prog;
+@@ -3223,8 +3268,12 @@ static int bpf_tracing_prog_attach(struc
+ 		 * EXT programs need to specify tgt_prog_fd, so they
+ 		 * re-attach in separate code path.
+ 		 */
++
++
+ 		if (prog->type != BPF_PROG_TYPE_TRACING &&
+-		    prog->type != BPF_PROG_TYPE_LSM) {
++		    prog->type != BPF_PROG_TYPE_LSM     &&
++            // CHANGED - ZSO 2024
++            prog->type != BPF_PROG_TYPE_REDACTOR) {
+ 			err = -EINVAL;
+ 			goto out_unlock;
+ 		}
+@@ -3644,6 +3716,11 @@ static int bpf_raw_tp_link_attach(struct
+ 			break;
+ 		}
+ 		return bpf_tracing_prog_attach(prog, 0, 0, 0);
++
++    // CHANGED - ZSO 2024
++    case BPF_PROG_TYPE_REDACTOR:
++        return bpf_tracing_prog_attach(prog, 0, 0, 0);
++
+ 	case BPF_PROG_TYPE_RAW_TRACEPOINT:
+ 	case BPF_PROG_TYPE_RAW_TRACEPOINT_WRITABLE:
+ 		if (strncpy_from_user(buf, user_tp_name, sizeof(buf) - 1) < 0)
+@@ -3775,6 +3866,9 @@ attach_type_to_prog_type(enum bpf_attach
+ 	case BPF_NETKIT_PRIMARY:
+ 	case BPF_NETKIT_PEER:
+ 		return BPF_PROG_TYPE_SCHED_CLS;
++    // CHANGED - ZSO 2024
++    case BPF_REDACTOR:
++        return BPF_PROG_TYPE_REDACTOR;
+ 	default:
+ 		return BPF_PROG_TYPE_UNSPEC;
+ 	}
+@@ -3830,6 +3924,12 @@ static int bpf_prog_attach_check_attach_
+ 		    attach_type != BPF_NETKIT_PEER)
+ 			return -EINVAL;
+ 		return 0;
++    // CHANGED - ZSO 2024
++    // NOTE - Czy to jest potrzebne?
++    case BPF_PROG_TYPE_REDACTOR:
++        if (attach_type != BPF_REDACTOR)
++            return -EINVAL;
++        return 0;
+ 	default:
+ 		ptype = attach_type_to_prog_type(attach_type);
+ 		if (ptype == BPF_PROG_TYPE_UNSPEC || ptype != prog->type)
+@@ -5692,6 +5793,67 @@ const struct bpf_prog_ops bpf_syscall_pr
+ 	.test_run = bpf_prog_test_run_syscall,
+ };
+ 
++// CHANGED - ZSO 2024
++static const struct bpf_func_proto *
++redactor_prog_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++    switch (func_id) {
++        case BPF_FUNC_get_current_pid_tgid:
++            return &bpf_get_current_pid_tgid_proto;
++        case BPF_FUNC_get_current_uid_gid:
++            return &bpf_get_current_uid_gid_proto;
++        case BPF_FUNC_copy_to_buffer:
++            return &bpf_copy_to_buffer_proto;
++        case BPF_FUNC_copy_from_buffer:
++            return &bpf_copy_from_buffer_proto;
++        
++        default:
++            return bpf_base_func_proto(func_id);
++    }
++}
++
++static bool redactor_prog_is_valid_access(int off, int size,
++					 enum bpf_access_type type,
++					 const struct bpf_prog *prog,
++					 struct bpf_insn_access_aux *info)
++{
++    // Proper values
++    if (off < 0 || size <= 0)
++        return false;
++
++    // Inside context struct
++    if (off + size > sizeof(struct redactor_ctx))
++        return false;
++
++    // Only read permission
++    if (type == BPF_READ)
++        return true;
++
++    return false;
++}
++
++
++const struct bpf_verifier_ops redactor_verifier_ops = {
++    .get_func_proto  = redactor_prog_func_proto,
++    .is_valid_access = redactor_prog_is_valid_access,
++};
++
++const struct bpf_prog_ops redactor_prog_ops = {
++    // Nothing
++};
++
++// Definicje funkcji do przyczepienia
++int bpf_redactor_decide(struct redactor_ctx *ctx)
++{
++    return NO_REDACT;
++}
++
++int bpf_redactor_redact(struct redactor_ctx *ctx)
++{
++    pr_warn("bpf_redactor_redact called without BPF program attached.");
++    return -EPERM;
++}
++
+ #ifdef CONFIG_SYSCTL
+ static int bpf_stats_handler(struct ctl_table *table, int write,
+ 			     void *buffer, size_t *lenp, loff_t *ppos)
+diff -EZwBrpus --speed-large-files --unidirectional-new-file original-kernel/kernel/bpf/verifier.c kernel/kernel/bpf/verifier.c
+--- original-kernel/kernel/bpf/verifier.c	2024-02-23 09:51:59.000000000 +0100
++++ kernel/kernel/bpf/verifier.c	2024-05-05 14:38:02.964838400 +0200
+@@ -20502,12 +20517,14 @@ int bpf_check_attach_target(struct bpf_v
+ 	default:
+ 		if (!prog_extension)
+ 			return -EINVAL;
++        
+ 		fallthrough;
+ 	case BPF_MODIFY_RETURN:
+ 	case BPF_LSM_MAC:
+ 	case BPF_LSM_CGROUP:
+ 	case BPF_TRACE_FENTRY:
+ 	case BPF_TRACE_FEXIT:
++    case BPF_REDACTOR:
+ 		if (!btf_type_is_func(t)) {
+ 			bpf_log(log, "attach_btf_id %u is not a function\n",
+ 				btf_id);
+Tylko w original-kernel: .mailmap
+Tylko w original-kernel: .rustfmt.toml
